@@ -26,13 +26,33 @@ This repository contains the implementation of OverLoCK (Overview-first-Look-Clo
 - Gradient Clipping: 0.5
 
 ## Files Structure
+
+### Core Model Files
 - `main.py`: Main training script
-- `model.py`: OverLoCK model implementation
+- `model.py`: OverLoCK model implementation  
+- `scalable_model.py`: Scalable model wrapper
 - `trainer.py`: Training and validation logic
+
+### Dataset & Configuration
 - `dataset.py`: Dataset handling (CIFAR-10, ImageNet-100)
-- `model_visualizer.py`: Visualization and evaluation tools
+- `model_configs.py`: Base model architecture configurations
 - `rtx4090_configs.py`: RTX 4090 optimized configurations
+- `imagenet100_configs.py`: ImageNet-100 specific configurations
+
+### Utilities & Tools
+- `model_visualizer.py`: Visualization and evaluation tools (ERF, GradCAM)
 - `confidence_calibration.py`: Model calibration utilities
+- `inference.py`: Model inference and evaluation
+- `run_calibration.py`: Calibration execution script
+
+### Setup & Data
+- `download_imagenet100.py`: ImageNet-100 dataset downloader
+- `extract_imagenet100.sh`: Dataset extraction script
+- `start_training.sh`: Training startup script
+
+### Documentation
+- `README.md`: Project documentation
+- `参考论文/`: Reference papers
 
 ## Usage
 ```bash
