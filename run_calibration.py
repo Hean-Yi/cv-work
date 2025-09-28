@@ -113,8 +113,8 @@ def evaluate_model(model, data_loader, device='cuda', method_name='原始'):
             images = images.to(device)
             labels = labels.to(device)
             
-            logits, _ = model(images)
-            probs = torch.softmax(logits, dim=1)
+            main_logits, aux_logits, clip_logits = model(images, use_aux=False)
+            probs = torch.softmax(main_logits, dim=1)
             
             # 获取预测结果
             confidences, predicted = torch.max(probs, 1)
@@ -172,16 +172,16 @@ def evaluate_calibrated_model(model, calibrator, data_loader, method='temperatur
             images = images.to(device)
             labels = labels.to(device)
             
-            logits, _ = model(images)
+            main_logits, aux_logits, clip_logits = model(images, use_aux=False)
             
             # 应用校准
             if method == 'temperature':
-                probs = calibrator.apply_temperature_scaling(logits)
+                probs = calibrator.apply_temperature_scaling(main_logits)
             elif method == 'platt':
-                original_probs = torch.softmax(logits, dim=1)
+                original_probs = torch.softmax(main_logits, dim=1)
                 probs = calibrator.apply_platt_scaling(original_probs)
             elif method == 'isotonic':
-                original_probs = torch.softmax(logits, dim=1)
+                original_probs = torch.softmax(main_logits, dim=1)
                 probs = calibrator.apply_isotonic_regression(original_probs)
             else:
                 raise ValueError(f"未知的校准方法: {method}")

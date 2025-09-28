@@ -116,10 +116,9 @@ class ModelVisualizer:
                     
                     # 计算推理时间
                     start_time = time.time()
-                    outputs = self.model(images)
-                    # OverLoCK模型返回 (logits, clip_logits)，我们只需要logits
-                    if isinstance(outputs, tuple):
-                        outputs = outputs[0]
+                    main_logits, aux_logits, clip_logits = self.model(images, use_aux=False)
+                    # 使用主分类器的输出
+                    outputs = main_logits
                     
                     torch.cuda.synchronize() if self.device.type == 'cuda' else None
                     end_time = time.time()
@@ -174,7 +173,7 @@ class ModelVisualizer:
         
         # 前向传播
         with torch.no_grad():
-            _ = self.model(input_tensor)
+            main_logits, _, _ = self.model(input_tensor, use_aux=False)
         
         # 移除钩子
         for hook in hooks:
@@ -206,7 +205,7 @@ class ModelVisualizer:
                 images = images.to(self.device)
                 
                 # 前向传播
-                outputs = self.model(images)
+                main_logits, aux_logits, clip_logits = self.model(images, use_aux=False)
                 
                 # 计算每一层的激活强度
                 for layer_name, activation in self.activations.items():
@@ -276,11 +275,10 @@ class ModelVisualizer:
         
         # 前向传播
         self.model.zero_grad()
-        outputs = self.model(images)
+        main_logits, aux_logits, clip_logits = self.model(images, use_aux=False)
         
-        # OverLoCK模型返回 (logits, clip_logits)，我们只需要logits
-        if isinstance(outputs, tuple):
-            outputs = outputs[0]
+        # 使用主分类器的输出
+        outputs = main_logits
         
         # 反向传播
         if labels.dim() == 1:

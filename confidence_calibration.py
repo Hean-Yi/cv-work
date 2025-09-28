@@ -157,8 +157,8 @@ class ConfidenceCalibrator:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                logits, _ = self.model(images)
-                all_logits.append(logits)
+                main_logits, aux_logits, clip_logits = self.model(images, use_aux=False)
+                all_logits.append(main_logits)
                 all_labels.append(labels)
         
         all_logits = torch.cat(all_logits, dim=0)

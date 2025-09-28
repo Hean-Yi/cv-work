@@ -165,11 +165,16 @@ class OverLoCKTrainer:
                 labels = labels.to(self.device, non_blocking=True)
 
                 # 前向传播
-                logits, clip_logits = self.model(images)
+                main_logits, aux_logits, clip_logits = self.model(images, use_aux=True)
 
                 # 计算损失
-                loss_cls = self.criterion(logits, labels)
+                loss_cls = self.criterion(main_logits, labels)
                 loss = loss_cls
+
+                # 添加辅助损失(如果有)
+                if aux_logits is not None:
+                    loss_aux = self.criterion(aux_logits, labels)
+                    loss = loss + 0.3 * loss_aux  # 辅助损失权重
 
                 # 添加CLIP损失(如果有)
                 if clip_logits is not None:
@@ -193,7 +198,7 @@ class OverLoCKTrainer:
                 # 计算吞吐量（每秒处理的样本数）
                 throughput = self.effective_batch_size / batch_time
                 total_loss += loss.item()
-                _, predicted = torch.max(logits.data, 1)
+                _, predicted = torch.max(main_logits.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
@@ -251,14 +256,14 @@ class OverLoCKTrainer:
                 labels = labels.to(self.device)
 
                 # 前向传播
-                logits, clip_logits = self.model(images)
+                main_logits, aux_logits, clip_logits = self.model(images, use_aux=False)
 
                 # 计算损失
-                loss = self.criterion(logits, labels)
+                loss = self.criterion(main_logits, labels)
 
                 # 统计
                 total_loss += loss.item()
-                _, predicted = torch.max(logits.data, 1)
+                _, predicted = torch.max(main_logits.data, 1)
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
@@ -540,8 +545,8 @@ class OverLoCKTrainer:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 
-                logits, _ = self.model(images)
-                probs = torch.softmax(logits, dim=1)
+                main_logits, _, _ = self.model(images)
+                probs = torch.softmax(main_logits, dim=1)
                 confidences, predicted = torch.max(probs, 1)
                 
                 for i in range(len(labels)):
@@ -579,16 +584,16 @@ class OverLoCKTrainer:
                     images = images.to(self.device)
                     labels = labels.to(self.device)
                     
-                    logits, _ = self.model(images)
+                    main_logits, _, _ = self.model(images)
                     
                     # 应用校准
                     if method == 'temperature':
-                        probs = calibrator.apply_temperature_scaling(logits)
+                        probs = calibrator.apply_temperature_scaling(main_logits)
                     elif method == 'platt':
-                        original_probs = torch.softmax(logits, dim=1)
+                        original_probs = torch.softmax(main_logits, dim=1)
                         probs = calibrator.apply_platt_scaling(original_probs)
                     elif method == 'isotonic':
-                        original_probs = torch.softmax(logits, dim=1)
+                        original_probs = torch.softmax(main_logits, dim=1)
                         probs = calibrator.apply_isotonic_regression(original_probs)
                     else:
                         continue

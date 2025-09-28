@@ -52,14 +52,12 @@ def main():
     
     batch_size = train_config['batch_size']
     learning_rate = train_config['learning_rate']
-    num_epochs = 3  # 改为3个epoch，更容易看出性能差异
+    num_epochs = 1
     weight_decay = train_config['weight_decay']
     use_mixed_precision = train_config['use_mixed_precision']
     gradient_clip_max_norm = train_config['gradient_clip_max_norm']
     
     print(f"⚙️ 训练配置: batch_size={batch_size}, lr={learning_rate}, epochs={num_epochs}")
-    if multi_gpu:
-        print(f"🚀 双GPU有效batch_size: {batch_size * 2} (每GPU: {batch_size})")
     print(f"💾 启用混合精度训练: {use_mixed_precision}")
     print(f"⚡ 梯度裁剪: {gradient_clip_max_norm}")
     
@@ -413,8 +411,8 @@ def main():
             model = model.cuda()
 
         # 推理
-        logits, clip_logits = model(test_batch)
-        predictions = torch.argmax(logits, dim=1)
+        main_logits, aux_logits, clip_logits = model(test_batch, use_aux=False)
+        predictions = torch.argmax(main_logits, dim=1)
         
         # 计算正确率
         correct = (predictions.cpu() == test_labels.cpu()).sum().item()
@@ -422,7 +420,7 @@ def main():
 
         print("\nInference Test (using val_dataset random samples):")
         print(f"Input shape: {test_batch.shape}")
-        print(f"Output logits shape: {logits.shape}")
+        print(f"Output logits shape: {main_logits.shape}")
         print(f"Predictions: {predictions.cpu().numpy()}")
         print(f"Ground truth: {test_labels.cpu().numpy()}")
         print(f"Accuracy: {accuracy:.2f}% ({correct}/{len(test_labels)})")
@@ -441,7 +439,7 @@ def main():
                 "predicted_class": pred_class,
                 "true_class": true_class,
                 "is_correct": is_correct,
-                "confidence": torch.softmax(logits[i], dim=0).max().cpu().item()
+                "confidence": torch.softmax(main_logits[i], dim=0).max().cpu().item()
             }
             results.append(result)
         
@@ -471,7 +469,7 @@ def main():
             pred_class = class_names[predictions[i].cpu().item()]
             true_class = class_names[test_labels[i].cpu().item()]
             is_correct = predictions[i].cpu().item() == test_labels[i].cpu().item()
-            confidence = torch.softmax(logits[i], dim=0).max().cpu().item()
+            confidence = torch.softmax(main_logits[i], dim=0).max().cpu().item()
             
             title_color = 'green' if is_correct else 'red'
             title = f'#{i+1} Pred: {pred_class}\nTrue: {true_class}\nConf: {confidence:.3f}'

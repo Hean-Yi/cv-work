@@ -293,7 +293,7 @@ class ScalableOverLoCKModel(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, x: torch.Tensor, use_aux: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         # BaseNet特征提取
         feats = self.base_net(x)
         
@@ -316,13 +316,25 @@ class ScalableOverLoCKModel(nn.Module):
         # 分类预测
         logits = self.classifier(pooled)
         
+        # 辅助分类器输出 (可选)
+        aux_logits = None
+        if use_aux:
+            # 使用context特征进行辅助分类
+            aux_pooled = self.global_pool(context).view(context.size(0), -1)
+            if not hasattr(self, 'aux_classifier'):
+                # 动态创建辅助分类器
+                self.aux_classifier = nn.Linear(aux_pooled.size(1), self.num_classes)
+                if aux_pooled.is_cuda:
+                    self.aux_classifier = self.aux_classifier.cuda()
+            aux_logits = self.aux_classifier(aux_pooled)
+        
         # CLIP辅助分类
         clip_logits = None
         if self.clip_head is not None:
             visual_feats = F.normalize(pooled, dim=1)
             clip_logits = visual_feats @ self.clip_head.t()
         
-        return logits, clip_logits
+        return logits, aux_logits, clip_logits
 
     def count_parameters(self):
         """统计模型参数"""
@@ -386,7 +398,7 @@ if __name__ == "__main__":
         # 测试前向传播
         x = torch.randn(2, 3, 224, 224)
         with torch.no_grad():
-            logits, clip_logits = model(x)
-            print(f"输出形状: {logits.shape}")
+            main_logits, aux_logits, clip_logits = model(x, use_aux=False)
+            print(f"输出形状: {main_logits.shape}")
             if clip_logits is not None:
                 print(f"CLIP输出形状: {clip_logits.shape}")

@@ -96,7 +96,8 @@ if __name__ == "__main__":
         test_input = torch.randn(2, 3, 224, 224)
         try:
             with torch.no_grad():
-                logits, clip_logits = model(test_input)
+                main_logits, aux_logits, clip_logits = model(test_input, use_aux=False)
             print(f"  • 前向传播: ✅ 成功")
+            print(f"  • 输出形状: main={main_logits.shape}, clip={clip_logits.shape if clip_logits is not None else 'None'}")
         except Exception as e:
             print(f"  • 前向传播: ❌ 失败 ({e})")
