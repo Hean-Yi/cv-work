@@ -94,57 +94,121 @@ class OverviewNet(nn.Module):
         return context
 
 
-class ContMix(nn.Module):
-    """Context-Mixing 动态卷积 - 论文核心实现"""
+class ContMixOptimized(nn.Module):
+    """
+    ContMix - 优化版本
+    
+    优化点：
+    1. 减少内存使用 - 避免存储完整的亲和力矩阵
+    2. 提高计算效率 - 使用深度可分离卷积近似
+    3. 保持核心思想 - 依然是动态上下文引导
+    """
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, 
-                 num_groups: int = 4, region_size: int = 7):
-        super(ContMix, self).__init__()
+                 num_groups: int = 4, region_size: int = 7, 
+                 use_efficient_impl: bool = True):
+        super(ContMixOptimized, self).__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.kernel_size = kernel_size
         self.num_groups = num_groups
         self.region_size = region_size
-        
-        # Q和K的投影层
-        self.query_conv = nn.Conv2d(in_ch, in_ch, kernel_size=1, bias=False)
-        self.key_conv = nn.Conv2d(in_ch, in_ch, kernel_size=1, bias=False)
-        
-        # 自适应平均池化到区域中心
-        self.region_pool = nn.AdaptiveAvgPool2d(region_size)
-        
-        # 动态核生成的线性层
-        self.kernel_gen = nn.Linear(region_size * region_size, kernel_size * kernel_size)
-        
-        # 分组处理
-        assert in_ch % num_groups == 0, "in_ch must be divisible by num_groups"
+        self.use_efficient_impl = use_efficient_impl
         self.group_ch = in_ch // num_groups
         
-        # 基础卷积核(用于与动态核组合)
-        self.base_conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, 
-                                  padding=kernel_size//2, bias=False)
-
+        # 轻量级的Q/K生成
+        self.qk_dim = min(in_ch // 2, 128)  # 降维以提高效率
+        self.query_conv = nn.Conv2d(in_ch, self.qk_dim, kernel_size=1, bias=False)
+        self.key_conv = nn.Conv2d(in_ch, self.qk_dim, kernel_size=1, bias=False)
+        
+        # 区域池化
+        self.region_pool = nn.AdaptiveAvgPool2d(region_size)
+        
+        if use_efficient_impl:
+            # 优化实现：使用注意力机制 + 深度可分离卷积
+            self.attention_proj = nn.Linear(region_size * region_size, kernel_size * kernel_size)
+            self.dw_conv = nn.Conv2d(in_ch, in_ch, kernel_size=kernel_size, 
+                                   padding=kernel_size//2, groups=in_ch, bias=False)
+            self.pw_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        else:
+            # 标准实现：简化版的动态卷积
+            self.dynamic_conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size,
+                                        padding=kernel_size//2, bias=False)
+            self.context_modulation = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(in_ch, in_ch // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_ch // 4, in_ch, 1),
+                nn.Sigmoid()
+            )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+    
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """优化版本的前向传播"""
         B, C, H, W = x.shape
         
-        # 生成查询Q和键K
-        Q = self.query_conv(x)  # B × C × H × W
-        K = self.key_conv(context)  # B × C × H × W
-        K = self.region_pool(K)  # B × C × S × S
+        if self.use_efficient_impl:
+            return self._efficient_forward(x, context)
+        else:
+            return self._standard_forward(x, context)
+    
+    def _efficient_forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """高效实现版本"""
+        B, C, H, W = x.shape
         
-        # 简化实现：使用注意力机制调制特征
-        # 计算上下文注意力权重
-        context_pool = torch.mean(K, dim=[2, 3], keepdim=True)  # B × C × 1 × 1
+        # 生成轻量级的Q和K
+        Q = self.query_conv(x)        # [B, qk_dim, H, W]
+        K = self.key_conv(context)    # [B, qk_dim, H, W]
+        K_pooled = self.region_pool(K)  # [B, qk_dim, S, S]
+        
+        # 计算全局上下文注意力
+        Q_global = F.adaptive_avg_pool2d(Q, 1)  # [B, qk_dim, 1, 1]
+        K_global = K_pooled.view(B, self.qk_dim, -1)  # [B, qk_dim, S²]
+        
+        # 注意力权重计算
+        attention = torch.bmm(
+            Q_global.view(B, 1, self.qk_dim), 
+            K_global
+        )  # [B, 1, S²]
+        attention = F.softmax(attention, dim=-1)
         
         # 生成动态权重
-        dynamic_weight = torch.sigmoid(context_pool)  # B × C × 1 × 1
+        dynamic_weights = self.attention_proj(attention)  # [B, 1, K²]
+        dynamic_weights = dynamic_weights.view(B, 1, self.kernel_size, self.kernel_size)
         
-        # 应用动态调制
-        modulated_x = x * dynamic_weight
+        # 应用深度可分离卷积 + 动态调制
+        x_dw = self.dw_conv(x)  # 深度卷积
         
-        # 基础卷积
-        out = self.base_conv(modulated_x)
+        # 动态调制 (简化版)
+        scale = F.adaptive_avg_pool2d(dynamic_weights, 1)  # [B, 1, 1, 1]
+        x_modulated = x_dw * scale.expand_as(x_dw)
         
-        return out
+        # 点卷积输出
+        output = self.pw_conv(x_modulated)
+        
+        return output
+    
+    def _standard_forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """标准实现版本"""
+        # 上下文调制
+        context_weight = self.context_modulation(context)
+        x_modulated = x * context_weight
+        
+        # 标准卷积
+        output = self.dynamic_conv(x_modulated)
+        
+        return output
+
+
+# 为了兼容性保留原名
+ContMix = ContMixOptimized
 
 
 class DynamicBlock(nn.Module):
@@ -157,7 +221,7 @@ class DynamicBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(in_ch)
         
         # GDSA (Gated Dynamic Spatial Aggregator)
-        self.contmix = ContMix(in_ch, in_ch)
+        self.contmix = ContMixOptimized(in_ch, in_ch, use_efficient_impl=True)
         
         # 门控机制
         self.gate_conv = nn.Conv2d(in_ch + context_ch, in_ch, kernel_size=1, bias=False)

@@ -11,6 +11,170 @@ from typing import List, Tuple, Optional
 from model_configs import ModelConfig, get_recommended_config
 
 
+class ContMixOptimized(nn.Module):
+    """
+    ContMix - 优化版本
+    
+    优化点：
+    1. 减少内存使用 - 避免存储完整的亲和力矩阵
+    2. 提高计算效率 - 使用深度可分离卷积近似
+    3. 保持核心思想 - 依然是动态上下文引导
+    """
+    def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, 
+                 num_groups: int = 4, region_size: int = 7, 
+                 use_efficient_impl: bool = True):
+        super(ContMixOptimized, self).__init__()
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.kernel_size = kernel_size
+        self.num_groups = num_groups
+        self.region_size = region_size
+        self.use_efficient_impl = use_efficient_impl
+        self.group_ch = in_ch // num_groups
+        
+        # 轻量级的Q/K生成
+        self.qk_dim = min(in_ch // 2, 128)  # 降维以提高效率
+        self.query_conv = nn.Conv2d(in_ch, self.qk_dim, kernel_size=1, bias=False)
+        self.key_conv = nn.Conv2d(in_ch, self.qk_dim, kernel_size=1, bias=False)
+        
+        # 区域池化
+        self.region_pool = nn.AdaptiveAvgPool2d(region_size)
+        
+        if use_efficient_impl:
+            # 优化实现：使用注意力机制 + 深度可分离卷积
+            self.attention_proj = nn.Linear(region_size * region_size, kernel_size * kernel_size)
+            self.dw_conv = nn.Conv2d(in_ch, in_ch, kernel_size=kernel_size, 
+                                   padding=kernel_size//2, groups=in_ch, bias=False)
+            self.pw_conv = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        else:
+            # 标准实现：简化版的动态卷积
+            self.dynamic_conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size,
+                                        padding=kernel_size//2, bias=False)
+            self.context_modulation = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(in_ch, in_ch // 4, 1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_ch // 4, in_ch, 1),
+                nn.Sigmoid()
+            )
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+    
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """优化版本的前向传播"""
+        B, C, H, W = x.shape
+        
+        if self.use_efficient_impl:
+            return self._efficient_forward(x, context)
+        else:
+            return self._standard_forward(x, context)
+    
+    def _efficient_forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """高效实现版本"""
+        B, C, H, W = x.shape
+        
+        # 生成轻量级的Q和K
+        Q = self.query_conv(x)        # [B, qk_dim, H, W]
+        K = self.key_conv(context)    # [B, qk_dim, H, W]
+        K_pooled = self.region_pool(K)  # [B, qk_dim, S, S]
+        
+        # 计算全局上下文注意力
+        Q_global = F.adaptive_avg_pool2d(Q, 1)  # [B, qk_dim, 1, 1]
+        K_global = K_pooled.view(B, self.qk_dim, -1)  # [B, qk_dim, S²]
+        
+        # 注意力权重计算
+        attention = torch.bmm(
+            Q_global.view(B, 1, self.qk_dim), 
+            K_global
+        )  # [B, 1, S²]
+        attention = F.softmax(attention, dim=-1)
+        
+        # 生成动态权重
+        dynamic_weights = self.attention_proj(attention)  # [B, 1, K²]
+        dynamic_weights = dynamic_weights.view(B, 1, self.kernel_size, self.kernel_size)
+        
+        # 应用深度可分离卷积 + 动态调制
+        x_dw = self.dw_conv(x)  # 深度卷积
+        
+        # 动态调制 (简化版)
+        scale = F.adaptive_avg_pool2d(dynamic_weights, 1)  # [B, 1, 1, 1]
+        x_modulated = x_dw * scale.expand_as(x_dw)
+        
+        # 点卷积输出
+        output = self.pw_conv(x_modulated)
+        
+        return output
+    
+    def _standard_forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """标准实现版本"""
+        # 上下文调制
+        context_weight = self.context_modulation(context)
+        x_modulated = x * context_weight
+        
+        # 标准卷积
+        output = self.dynamic_conv(x_modulated)
+        
+        return output
+
+
+class ScalableDynamicBlock(nn.Module):
+    """可扩展的Dynamic Block - Focus-Net的核心构建块"""
+    def __init__(self, in_ch: int, context_ch: int):
+        super(ScalableDynamicBlock, self).__init__()
+        # 残差深度卷积
+        self.dw_conv = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, 
+                                groups=in_ch, bias=False)
+        self.bn1 = nn.BatchNorm2d(in_ch)
+        
+        # GDSA (Gated Dynamic Spatial Aggregator)
+        self.contmix = ContMixOptimized(in_ch, in_ch, use_efficient_impl=True)
+        
+        # 门控机制
+        self.gate_conv = nn.Conv2d(in_ch + context_ch, in_ch, kernel_size=1, bias=False)
+        self.gate_act = nn.Sigmoid()
+        
+        # ConvFFN
+        self.ffn = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch * 4, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_ch * 4),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(in_ch * 4, in_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(in_ch)
+        )
+        
+        self.relu = nn.ReLU(inplace=False)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        identity = x
+        
+        # 残差深度卷积
+        x = self.relu(self.bn1(self.dw_conv(x)))
+        
+        # 上下文融合
+        fused = torch.cat([x, context], dim=1)
+        gate = self.gate_act(self.gate_conv(fused))
+        
+        # GDSA with ContMix
+        x_contmix = self.contmix(x, context)
+        x = x_contmix * gate + x * (1 - gate)
+        
+        # 残差连接
+        x = x + identity
+        
+        # ConvFFN
+        ffn_out = self.ffn(x)
+        x = x + ffn_out
+        
+        return x, context
+
+
 class ScalableBaseBlock(nn.Module):
     """可扩展的基础残差卷积块"""
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
@@ -43,12 +207,12 @@ class ScalableBaseBlock(nn.Module):
 
 
 class ScalableBaseNet(nn.Module):
-    """可扩展的基础特征提取网络"""
+    """可扩展的基础特征提取网络 - 统一为3阶段架构"""
     def __init__(self, config: ModelConfig):
         super(ScalableBaseNet, self).__init__()
         self.config = config
         
-        # Stem层
+        # Stage 1: 初始特征提取 - 输入→H/4×W/4
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
@@ -56,111 +220,105 @@ class ScalableBaseNet(nn.Module):
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
         
-        # 构建各阶段
-        self.stages = nn.ModuleList()
-        in_ch = 64
+        # Stage 2: H/4×W/4 → H/8×W/8
+        # 使用config中的第一个通道配置
+        stage2_ch = config.base_channels[0] if config.base_channels else 128
+        stage2_blocks = config.base_blocks[0] if config.base_blocks else 2
         
-        for i, (out_ch, num_blocks) in enumerate(zip(config.base_channels, config.base_blocks)):
-            stage = nn.ModuleList()
-            
-            # 第一个块可能需要降采样
-            stride = 2 if i > 0 else 1
-            stage.append(ScalableBaseBlock(in_ch, out_ch, stride))
-            
-            # 后续块
-            for _ in range(1, num_blocks):
-                stage.append(ScalableBaseBlock(out_ch, out_ch))
-            
-            self.stages.append(stage)
-            in_ch = out_ch
+        self.stage2 = nn.ModuleList()
+        self.stage2.append(ScalableBaseBlock(64, stage2_ch, stride=2))  # 降采样
+        for _ in range(1, stage2_blocks):
+            self.stage2.append(ScalableBaseBlock(stage2_ch, stage2_ch))
+        
+        # Stage 3: H/8×W/8 → H/16×W/16 (中层特征)
+        # 使用config中的第二个通道配置
+        stage3_ch = config.base_channels[1] if len(config.base_channels) > 1 else 256
+        stage3_blocks = config.base_blocks[1] if len(config.base_blocks) > 1 else 2
+        
+        self.stage3 = nn.ModuleList()
+        self.stage3.append(ScalableBaseBlock(stage2_ch, stage3_ch, stride=2))  # 降采样
+        for _ in range(1, stage3_blocks):
+            self.stage3.append(ScalableBaseBlock(stage3_ch, stage3_ch))
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        x = self.stem(x)
-        features = []
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """返回3阶段特征，与model.py保持一致"""
+        # Stage 1: H/4×W/4
+        x1 = self.stem(x)
         
-        for stage in self.stages:
-            for block in stage:
-                x = block(x)
-            features.append(x)
+        # Stage 2: H/8×W/8  
+        x2 = x1
+        for block in self.stage2:
+            x2 = block(x2)
         
-        return features
+        # Stage 3: H/16×W/16 (中层特征)
+        x3 = x2
+        for block in self.stage3:
+            x3 = block(x3)
+        
+        return x1, x2, x3
 
 
 class ScalableOverviewNet(nn.Module):
-    """可扩展的轻量级全局上下文注意力网络"""
-    def __init__(self, in_ch: int):
+    """可扩展的轻量级上下文先验生成网络 - 统一与model.py架构"""
+    def __init__(self, in_ch: int, out_ch: int = None):
         super(ScalableOverviewNet, self).__init__()
-        # 使用更高效的深度可分离卷积
-        self.down = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=2, padding=1, groups=in_ch, bias=False),
-            nn.Conv2d(in_ch, in_ch, kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_ch),
+        if out_ch is None:
+            out_ch = in_ch
+            
+        # 快速下采样到 H/32 × W/32
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
             nn.ReLU(inplace=False)
         )
         
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, groups=in_ch, bias=False),
-            nn.Conv2d(in_ch, in_ch, kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_ch),
-            nn.ReLU(inplace=False)
+        # 轻量级处理块
+        self.process_block = nn.Sequential(
+            ScalableBaseBlock(out_ch, out_ch),
+            ScalableBaseBlock(out_ch, out_ch)
         )
         
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        # 上采样回中层特征分辨率用于引导
+        self.context_proj = nn.Sequential(
+            nn.Conv2d(out_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch)
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = self.down(x)
-        y = self.conv(y)
-        y = self.upsample(y)
-        return torch.sigmoid(y)
-
-
-class ScalableFocusBlock(nn.Module):
-    """可扩展的FocusNet块"""
-    def __init__(self, in_ch: int, out_ch: int):
-        super(ScalableFocusBlock, self).__init__()
-        # 使用深度可分离卷积提高效率
-        self.dwconv = nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1, groups=in_ch, bias=False)
-        self.bn1 = nn.BatchNorm2d(in_ch)
-        self.pwconv = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_ch)
-        self.relu = nn.ReLU(inplace=False)
+    def forward(self, mid_level_feat: torch.Tensor) -> torch.Tensor:
+        """生成粗糙但语义丰富的上下文先验"""
+        # 生成粗糙但语义丰富的上下文先验
+        context = self.downsample(mid_level_feat)  # H/32 × W/32
+        context = self.process_block(context)
         
-        # 上下文融合
-        self.context_fc = nn.Linear(in_ch, in_ch)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        B, C, H, W = x.size()
+        # 上采样用于后续引导
+        context = F.interpolate(context, size=mid_level_feat.shape[2:], 
+                               mode='bilinear', align_corners=False)
+        context = self.context_proj(context)
         
-        # 上下文注意力
-        ctx = context.view(B, C, -1).mean(dim=2)  # Global average pooling
-        attn = self.sigmoid(self.context_fc(ctx)).view(B, C, 1, 1)
-        
-        # 应用注意力
-        x_attended = x * attn
-        
-        # 深度可分离卷积
-        out = self.relu(self.bn1(self.dwconv(x_attended)))
-        out = self.relu(self.bn2(self.pwconv(out)))
-        
-        return out
+        return context
 
 
 class ScalableFocusNet(nn.Module):
-    """可扩展的高分辨率细节感知网络"""
+    """可扩展的高分辨率细节感知网络 - 统一使用DynamicBlock"""
     def __init__(self, config: ModelConfig):
         super(ScalableFocusNet, self).__init__()
-        in_ch = config.base_channels[-1]  # 使用最后一层的通道数
+        # 使用最后一层的通道数作为输入
+        in_ch = config.base_channels[1] if len(config.base_channels) > 1 else 256
         
+        # 构建多个动态块
         self.blocks = nn.ModuleList()
-        for _ in range(config.focus_blocks):
-            self.blocks.append(ScalableFocusBlock(in_ch, in_ch))
+        num_blocks = config.focus_blocks if hasattr(config, 'focus_blocks') else 6
+        
+        for _ in range(num_blocks):
+            self.blocks.append(ScalableDynamicBlock(in_ch, in_ch))
 
     def forward(self, base_feat: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = base_feat * context
+        """Focus-Net前向传播，使用上下文流引导"""
+        x = base_feat
         
+        # 通过所有动态块传播上下文
         for block in self.blocks:
-            x = block(x, context)
+            x, context = block(x, context)
             
         return x
 
@@ -241,7 +399,7 @@ class ScalableCBAM(nn.Module):
 
 
 class ScalableOverLoCKModel(nn.Module):
-    """可扩展的OverLoCK主模型"""
+    """可扩展的OverLoCK主模型 - 统一论文架构"""
     def __init__(self, class_names: List[str], config: Optional[ModelConfig] = None):
         super(ScalableOverLoCKModel, self).__init__()
         
@@ -253,21 +411,26 @@ class ScalableOverLoCKModel(nn.Module):
             config = get_recommended_config("balanced")
         self.config = config
         
-        # 初始化子网络
-        self.base_net = ScalableBaseNet(config)
-        self.overview_net = ScalableOverviewNet(config.base_channels[-1])
-        self.focus_net = ScalableFocusNet(config)
-        self.fpn = ScalableFPN(config)
-        self.cbam = ScalableCBAM(config)
+        # OverLoCK三阶段架构
+        self.base_net = ScalableBaseNet(config)  # BaseNet: 3阶段特征提取
+        
+        # 获取中层特征通道数
+        mid_ch = config.base_channels[1] if len(config.base_channels) > 1 else 256
+        
+        self.overview_net = ScalableOverviewNet(mid_ch, mid_ch)  # OverviewNet: 上下文先验
+        self.focus_net = ScalableFocusNet(config)  # FocusNet: 细节感知
         
         # 分类头
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.classifier = nn.Linear(config.fpn_out_channels, self.num_classes)
+        self.classifier = nn.Linear(mid_ch, self.num_classes)
+        
+        # 辅助分类器
+        self.aux_classifier = nn.Linear(mid_ch, self.num_classes)
         
         # 可选的CLIP头
-        if config.use_clip:
+        if hasattr(config, 'use_clip') and config.use_clip:
             self.clip_head = nn.Parameter(
-                torch.randn(self.num_classes, config.fpn_out_channels), 
+                torch.randn(self.num_classes, mid_ch), 
                 requires_grad=False
             )
             nn.init.normal_(self.clip_head, std=0.02)
@@ -294,47 +457,35 @@ class ScalableOverLoCKModel(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor, use_aux: bool = False) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # BaseNet特征提取
-        feats = self.base_net(x)
+        """OverLoCK三阶段前向传播"""
+        # BaseNet: 三阶段特征提取
+        stage1_feat, stage2_feat, mid_level_feat = self.base_net(x)  # H/4, H/8, H/16
         
-        # Overview网络生成上下文注意力
-        context = self.overview_net(feats[-1])
+        # OverviewNet: 生成轻量级上下文先验
+        context = self.overview_net(mid_level_feat)
         
-        # Focus网络细节感知
-        focus_out = self.focus_net(feats[-1], context)
-        
-        # FPN多尺度融合
-        fused_feats = self.fpn(feats[:-1] + [focus_out])
-        fused_feature = fused_feats[0]  # 使用最高分辨率特征
-        
-        # CBAM注意力增强
-        attended = self.cbam(fused_feature)
+        # FocusNet: 上下文引导的细节感知
+        focus_out = self.focus_net(mid_level_feat, context)
         
         # 全局池化
-        pooled = self.global_pool(attended).view(attended.size(0), -1)
+        pooled = self.global_pool(focus_out).view(focus_out.size(0), -1)
         
-        # 分类预测
-        logits = self.classifier(pooled)
+        # 主分类预测
+        main_logits = self.classifier(pooled)
         
-        # 辅助分类器输出 (可选)
+        # 辅助分类器输出
         aux_logits = None
         if use_aux:
-            # 使用context特征进行辅助分类
             aux_pooled = self.global_pool(context).view(context.size(0), -1)
-            if not hasattr(self, 'aux_classifier'):
-                # 动态创建辅助分类器
-                self.aux_classifier = nn.Linear(aux_pooled.size(1), self.num_classes)
-                if aux_pooled.is_cuda:
-                    self.aux_classifier = self.aux_classifier.cuda()
             aux_logits = self.aux_classifier(aux_pooled)
         
-        # CLIP辅助分类
+        # CLIP输出
         clip_logits = None
         if self.clip_head is not None:
             visual_feats = F.normalize(pooled, dim=1)
             clip_logits = visual_feats @ self.clip_head.t()
         
-        return logits, aux_logits, clip_logits
+        return main_logits, aux_logits, clip_logits
 
     def count_parameters(self):
         """统计模型参数"""
@@ -353,8 +504,13 @@ class ScalableOverLoCKModel(nn.Module):
         print(f"模型大小: {model_size_mb:.1f} MB")
         print(f"BaseNet通道数: {self.config.base_channels}")
         print(f"BaseNet块数: {self.config.base_blocks}")
-        print(f"FPN通道数: {self.config.fpn_out_channels}")
-        print(f"FocusNet块数: {self.config.focus_blocks}")
+        
+        # 获取中层特征通道数
+        mid_ch = self.config.base_channels[1] if len(self.config.base_channels) > 1 else 256
+        print(f"中层特征通道数: {mid_ch}")
+        
+        focus_blocks = getattr(self.config, 'focus_blocks', 6)
+        print(f"FocusNet块数: {focus_blocks}")
 
 
 # 便捷函数
@@ -398,7 +554,9 @@ if __name__ == "__main__":
         # 测试前向传播
         x = torch.randn(2, 3, 224, 224)
         with torch.no_grad():
-            main_logits, aux_logits, clip_logits = model(x, use_aux=False)
-            print(f"输出形状: {main_logits.shape}")
+            main_logits, aux_logits, clip_logits = model(x, use_aux=True)
+            print(f"主输出形状: {main_logits.shape}")
+            if aux_logits is not None:
+                print(f"辅助输出形状: {aux_logits.shape}")
             if clip_logits is not None:
                 print(f"CLIP输出形状: {clip_logits.shape}")
